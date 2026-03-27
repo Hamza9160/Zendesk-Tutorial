@@ -1,9 +1,5 @@
 # Concierge Feature - Technical Documentation
 
-> **Version:** 1.0  
-> **Last Updated:** March 2026  
-> **Platform:** Android (Kotlin + Jetpack Compose)
-
 ---
 
 ## Table of Contents
@@ -11,13 +7,15 @@
 1. [Overview](#overview)
 2. [Architecture](#architecture)
 3. [Zendesk User Setup (Prerequisite)](#zendesk-user-setup-prerequisite)
-4. [Zendesk Logout](#zendesk-logout)
+4. [JWT Token Management (Single Source of Truth)](#jwt-token-management-single-source-of-truth)
 5. [Screen Flow Diagram](#screen-flow-diagram)
 6. [Submit Button - Complete API Flow](#submit-button---complete-api-flow)
-7. [Screens & Components](#screens--components)
-8. [Ticket Status Filtering](#ticket-status-filtering)
-9. [API Endpoints](#api-endpoints)
-10. [Error Handling](#error-handling)
+7. [API Retry System](#api-retry-system)
+8. [Zendesk Logout](#zendesk-logout)
+9. [Screens & Components](#screens--components)
+10. [Ticket Status Filtering](#ticket-status-filtering)
+11. [API Endpoints](#api-endpoints)
+12. [Error Handling](#error-handling)
 
 ---
 
@@ -73,9 +71,9 @@ The **Concierge** feature enables prescribers to submit requests directly from t
 │  │   │ Concierge       │  │ Request List    │  │ Archived        │    │  │
 │  │   │ Screen          │  │ Screen          │  │ Screen          │    │  │
 │  │   │                 │  │                 │  │                 │    │  │
-│  │   │ • Request Types │  │ • New/Open only │  │ • Closed        │    │  │
-│  │   │ • Text Input    │  │ • Tap to open   │  │ • Solved        │    │  │
-│  │   │ • Submit Button │  │ • Refresh       │  │ • Pending/Hold  │    │  │
+│  │   │ • Request Types │  │ • New/Open/     │  │ • Closed        │    │  │
+│  │   │ • Text Input    │  │   Pending only  │  │ • Solved        │    │  │
+│  │   │ • Submit Button │  │ • Tap to open   │  │ • Hold          │    │  │
 │  │   └────────┬────────┘  └────────┬────────┘  └────────┬────────┘    │  │
 │  │            │                    │                    │              │  │
 │  │   ┌────────┴────────┐  ┌────────┴────────────────────┴────────┐    │  │
@@ -182,10 +180,13 @@ Before a user can submit requests, they must be registered with Zendesk. This ha
            │
            ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                      STEP 3: GENERATE JWT TOKEN                         │
+│                      STEP 3: GET OR CREATE JWT TOKEN                    │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  JWT Token is generated locally for Zendesk SDK authentication          │
+│  Uses: sharedViewModel.getOrCreateJwtToken()                            │
+│                                                                         │
+│  • Returns cached JWT if available                                      │
+│  • Generates new JWT if cache is empty                                  │
 │                                                                         │
 │  JWT Claims:                                                            │
 │  {                                                                      │
@@ -258,47 +259,92 @@ GET {BASE_URL}/sc/v2/apps/{appId}/users?externalId={npi}
 
 ---
 
-## Zendesk Logout
+## JWT Token Management (Single Source of Truth)
 
-When a user signs out of the app, they are also logged out of the Zendesk SDK to ensure proper session cleanup.
+The app implements a **single source of truth** pattern for JWT token management. Instead of generating new JWT tokens at multiple places throughout the app, all JWT operations go through `SharedViewModel.getOrCreateJwtToken()`.
 
-### Logout Flow
+### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          ZENDESK LOGOUT FLOW                            │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│                     JWT TOKEN MANAGEMENT                                  │
+└───────────────────────────────────────────────────────────────────────────┘
 
-    USER TAPS SIGN OUT
-           │
-           ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      ZENDESK SDK LOGOUT                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  Zendesk.instance.logoutUser()                                          │
-│                                                                         │
-│  On Success:                                                            │
-│  • Reset login state flag                                               │
-│  • Clear Zendesk session                                                │
-│                                                                         │
-│  On Failure:                                                            │
-│  • Log error for debugging                                              │
-│  • Reset login state flag anyway                                        │
-│                                                                         │
-│  Note: If Zendesk SDK is not initialized, logout is skipped             │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-           │
-           ▼
-    PROCEED WITH APP SIGN OUT
+                        SharedViewModel
+                              │
+              ┌───────────────┼───────────────┐
+              │               │               │
+              ▼               ▼               ▼
+        getOrCreateJwtToken()  setJwtToken()  clearJwtToken()
+              │                    │               │
+              │                    │               │
+    ┌─────────┴─────────┐         │               │
+    │                   │         │               │
+    ▼                   ▼         │               │
+  JWT exists?        No JWT       │               │
+    │                   │         │               │
+    │ Yes               │         │               │
+    │                   ▼         │               │
+    │           generateTestJwt() │               │
+    │                   │         │               │
+    │                   └─────────┘               │
+    │                       │                     │
+    ▼                       ▼                     ▼
+  Return               Store & Return         Clear JWT
+  existing JWT         new JWT               (on logout)
 ```
 
-### When Logout is Called
+### Implementation
 
-- User taps "Sign Out" in the Profile/Account screen
-- Deactivate account flow
-- Any session invalidation scenario
+```
+fun getOrCreateJwtToken(): String {
+    val existingJwt = _jwtToken.value
+    if (!existingJwt.isNullOrEmpty()) {
+        return existingJwt
+    }
+    
+    val profile = getProfile.value
+    val npi = profile?.npi?.toString() ?: ""
+    val fullName = "${profile?.firstname ?: ""} ${profile?.lastname ?: ""}".trim()
+    val email = profile?.email ?: ""
+    
+    return generateTestJwt(
+        externalId = npi,
+        name = fullName,
+        email = email,
+        sharedViewModel = this
+    )
+}
+
+fun clearJwtToken() {
+    _jwtToken.value = null
+}
+```
+
+### Usage Pattern
+
+All screens and ViewModels use `getOrCreateJwtToken()` instead of calling `generateTestJwt()` directly:
+
+```
+val jwtToken = sharedViewModel.getOrCreateJwtToken()
+```
+
+### JWT Lifecycle
+
+| Event | Action |
+|-------|--------|
+| First Zendesk operation | `getOrCreateJwtToken()` generates and caches JWT |
+| Subsequent operations | Returns cached JWT (no regeneration) |
+| User signs out | `clearJwtToken()` removes cached JWT |
+| Account deactivation | `clearJwtToken()` removes cached JWT |
+| Next login | Fresh JWT generated on first Zendesk operation |
+
+### Benefits
+
+1. **Consistency** - Same JWT used across all Zendesk operations
+2. **Performance** - Avoids redundant JWT generation
+3. **Reliability** - Eliminates sync issues from multiple tokens
+4. **Maintainability** - Single place to modify JWT logic
 
 ---
 
@@ -519,7 +565,18 @@ When user clicks the **Submit** button, the following sequence executes:
 │                     OPEN ZENDESK MESSAGING                                │
 ├───────────────────────────────────────────────────────────────────────────┤
 │                                                                           │
-│  Action: Open Zendesk Messaging SDK with the conversationId               │
+│  Action: Open Zendesk Messaging SDK with Most Recent Active Conversation  │
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  MessagingScreen.MostRecentActiveConversation(                      │  │
+│  │      onExit = MessagingScreen.ExitAction.Close                      │  │
+│  │  )                                                                  │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+│  WHY MostRecentActiveConversation (not Conversation by ID):               │
+│  • Newly created conversation is the most recent one                      │
+│  • Avoids sync issues where SDK can't find conversation by ID immediately │
+│  • More reliable than waiting for conversation ID to be indexed           │
 │                                                                           │
 │  User can now:                                                            │
 │  • See their submitted request                                            │
@@ -542,6 +599,235 @@ When user clicks the **Submit** button, the following sequence executes:
 
 ---
 
+## API Retry System
+
+The Concierge feature implements a robust retry system that allows users to retry from any failed step without losing progress.
+
+### Retry Architecture
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         API RETRY STATE MACHINE                           │
+└───────────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │                     ConciergeApiTrigger Enum                        │
+    │                                                                     │
+    │   None ─────▶ CreateConversation ─────▶ SendMessage                 │
+    │                      │                       │                      │
+    │                      │                       ▼                      │
+    │                      │               FetchTicket ─────▶ SetRequester│
+    │                      │                       │                      │
+    │                      ▼                       ▼                      │
+    │              [On Failure]              [On Failure]                 │
+    │                   │                         │                       │
+    │                   └─────────┬───────────────┘                       │
+    │                             ▼                                       │
+    │                    Show Retry Dialog                                │
+    │                             │                                       │
+    │               ┌─────────────┴─────────────┐                        │
+    │               │                           │                        │
+    │               ▼                           ▼                        │
+    │         [User taps OK]          [User taps Retry]                  │
+    │               │                           │                        │
+    │               ▼                           ▼                        │
+    │         Reset State              Resume from failed step           │
+    │         (start fresh)            (preserved data used)             │
+    └─────────────────────────────────────────────────────────────────────┘
+```
+
+### Preserved Data on Failure
+
+When an API step fails, the following data is preserved for retry:
+
+| Data | Preserved For |
+|------|---------------|
+| `conversationId` | Steps 3, 4, 5 (if Step 2 succeeded) |
+| `ticketId` | Step 5 (if Step 4 succeeded) |
+| `convoTag` | All steps (unique identifier for ticket search) |
+| `message` | All steps (user's request text) |
+| `subject` | All steps (request type) |
+| User profile data | All steps (NPI, email, name, phone) |
+
+### Retry Dialog
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          API RETRY DIALOG                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│    ┌───────────────────────────────────────────────────────────────┐   │
+│    │                                                               │   │
+│    │                     ⚠️ {Step Name} Failed                     │   │
+│    │                                                               │   │
+│    │              {Error Message Description}                      │   │
+│    │                                                               │   │
+│    │    ┌─────────────┐              ┌─────────────┐              │   │
+│    │    │     OK      │              │    Retry    │              │   │
+│    │    └─────────────┘              └─────────────┘              │   │
+│    │                                                               │   │
+│    └───────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  OK Button:                                                             │
+│  • Dismisses dialog                                                     │
+│  • Calls resetSubmissionState()                                         │
+│  • Clears all preserved data                                            │
+│  • User returns to form with original input                             │
+│                                                                         │
+│  Retry Button:                                                          │
+│  • Dismisses dialog                                                     │
+│  • Calls retryCurrentStep()                                             │
+│  • Uses preserved data (conversationId, ticketId, etc.)                 │
+│  • Resumes from exact failed step                                       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step-by-Step Retry Behavior
+
+| Step Failed | What's Preserved | Retry Starts From |
+|-------------|------------------|-------------------|
+| Create Conversation | Form data only | Step 2 (fresh conversation) |
+| Send Message | conversationId | Step 3 (same conversation) |
+| Fetch Ticket | conversationId | Step 4 (resume polling) |
+| Set Requester | conversationId, ticketId | Step 5 (same ticket) |
+
+### Implementation
+
+```
+private var apiTrigger: ConciergeApiTrigger = ConciergeApiTrigger.None
+
+private fun showApiFailureDialog(
+    stepName: String, 
+    errorMsg: String, 
+    failedTrigger: ConciergeApiTrigger
+) {
+    apiTrigger = failedTrigger
+    _uiState.update {
+        it.copy(
+            showApiRetryDialog = true,
+            apiRetryStepName = stepName,
+            apiRetryErrorMessage = errorMsg,
+            showLoader = false
+        )
+    }
+}
+
+fun retryCurrentStep() {
+    _uiState.update { it.copy(showApiRetryDialog = false, showLoader = true) }
+    processApiTrigger()
+}
+
+fun resetSubmissionState() {
+    apiTrigger = ConciergeApiTrigger.None
+    conversationId = null
+    ticketId = null
+}
+```
+
+### Retry in Request List & Archived Screens
+
+Opening a conversation from the request list also has retry functionality:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                 OPEN CONVERSATION RETRY FLOW                            │
+└─────────────────────────────────────────────────────────────────────────┘
+
+    User taps request card
+            │
+            ▼
+    Step 1: Fetch conversation ID from ticket custom field
+            │
+            ├──── Success ────▶ Step 2: Login to Zendesk SDK
+            │                          │
+            │                          ├──── Success ────▶ Open Messaging
+            │                          │
+            │                          └──── Failure ────▶ Show Retry Dialog
+            │
+            └──── Failure ────▶ Show Retry Dialog
+                                       │
+                               ┌───────┴───────┐
+                               │               │
+                               ▼               ▼
+                        [User taps OK]  [User taps Retry]
+                               │               │
+                               ▼               ▼
+                        Dismiss dialog   Resume from failed step
+                                        (uses cached conversationId
+                                         if available)
+```
+
+### ConversationStep Enum
+
+```
+enum class ConversationStep {
+    IDLE,
+    FETCH_CONVERSATION,
+    ZENDESK_LOGIN,
+    OPEN_MESSAGING
+}
+```
+
+---
+
+## Zendesk Logout
+
+When a user signs out of the app, they are also logged out of the Zendesk SDK and the cached JWT token is cleared.
+
+### Logout Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          ZENDESK LOGOUT FLOW                            │
+└─────────────────────────────────────────────────────────────────────────┘
+
+    USER TAPS SIGN OUT
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      STEP 1: CLEAR JWT TOKEN                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  sharedViewModel.clearJwtToken()                                        │
+│                                                                         │
+│  Purpose: Remove cached JWT so next user gets fresh token               │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      STEP 2: ZENDESK SDK LOGOUT                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Zendesk.instance.logoutUser()                                          │
+│                                                                         │
+│  On Success:                                                            │
+│  • Reset login state flag                                               │
+│  • Clear Zendesk session                                                │
+│                                                                         │
+│  On Failure:                                                            │
+│  • Log error for debugging                                              │
+│  • Reset login state flag anyway                                        │
+│                                                                         │
+│  Note: If Zendesk SDK is not initialized, logout is skipped             │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+    PROCEED WITH APP SIGN OUT
+```
+
+### When Logout is Called
+
+| Event | JWT Cleared | Zendesk Logout | Session Cleared |
+|-------|-------------|----------------|-----------------|
+| Sign Out (Remember Me = false) | ✅ | ✅ | ✅ |
+| Sign Out (Remember Me = true) | ✅ | ✅ | ❌ (credentials kept) |
+| Deactivate Account | ✅ | ✅ | ✅ |
+
+---
+
 ## Screens & Components
 
 ### 1. Concierge Screen
@@ -560,6 +846,7 @@ When user clicks the **Submit** button, the following sequence executes:
 **Active Request Status:**
 - `new` - Fresh tickets awaiting initial response
 - `open` - Tickets currently being worked on
+- `pending` - Waiting for customer response
 
 **Features:**
 - Auto-refresh on screen resume (ON_RESUME lifecycle event)
@@ -571,10 +858,9 @@ When user clicks the **Submit** button, the following sequence executes:
 
 **Purpose:** Display all non-active requests
 
-**Archived Request Status (any status NOT "new" or "open"):**
+**Archived Request Status (any status NOT "new", "open", or "pending"):**
 - `closed` - Request was resolved and closed
 - `solved` - Request was completed successfully
-- `pending` - Waiting for customer response
 - `hold` - Temporarily on hold
 - Any other future status
 
@@ -614,16 +900,16 @@ Tickets are considered **active** if their status is:
 |--------|-------------|
 | `new` | Fresh ticket awaiting initial response |
 | `open` | Ticket currently being worked on |
+| `pending` | Waiting for customer response |
 
 ### Archived Requests (Archived Screen)
 
-Tickets are considered **archived** if their status is **anything other than "new" or "open"**:
+Tickets are considered **archived** if their status is **anything other than "new", "open", or "pending"**:
 
 | Status | Description |
 |--------|-------------|
 | `closed` | Request was resolved and closed |
 | `solved` | Request was completed successfully |
-| `pending` | Waiting for customer response |
 | `hold` | Temporarily on hold |
 | *any other* | Future statuses automatically go here |
 
@@ -631,14 +917,13 @@ Tickets are considered **archived** if their status is **anything other than "ne
 
 The filtering logic is implemented in the ViewModel:
 
-```kotlin
-// Extension function to check if a request is active
+```
 private fun ZendeskRequest.isActive(): Boolean {
     return status.equals("new", ignoreCase = true) ||
-            status.equals("open", ignoreCase = true)
+            status.equals("open", ignoreCase = true) ||
+            status.equals("pending", ignoreCase = true)
 }
 
-// Extension function to check if a request is archived
 private fun ZendeskRequest.isArchived(): Boolean {
     return !isActive()
 }
@@ -646,13 +931,11 @@ private fun ZendeskRequest.isArchived(): Boolean {
 
 The UI state provides computed properties for easy access:
 
-```kotlin
+```
 data class RequestsListUiState(...) {
-    // Returns only active requests (new or open)
     val activeRequests: List<ZendeskRequest>
         get() = allRequests.filterNot { it.isArchived() }
 
-    // Returns only archived requests (everything else)
     val archivedRequests: List<ZendeskRequest>
         get() = allRequests.filter { it.isArchived() }
 }
@@ -887,9 +1170,11 @@ This handles cases where:
 ## Security Considerations
 
 1. **JWT Authentication:** Zendesk SDK login uses JWT tokens with 6-hour expiry
-2. **Basic Auth:** Sunshine Conversations API uses app key/secret (Base64 encoded)
-3. **Token Storage:** Access tokens should be stored securely (encrypted storage recommended)
-4. **NPI as External ID:** User's NPI is used as the external identifier in Zendesk
+2. **Single Source of Truth:** JWT is managed centrally via `SharedViewModel.getOrCreateJwtToken()`
+3. **JWT Cleanup:** JWT is cleared on logout/deactivation via `clearJwtToken()`
+4. **Basic Auth:** Sunshine Conversations API uses app key/secret (Base64 encoded)
+5. **Token Storage:** Access tokens should be stored securely (encrypted storage recommended)
+6. **NPI as External ID:** User's NPI is used as the external identifier in Zendesk
 
 ---
 
